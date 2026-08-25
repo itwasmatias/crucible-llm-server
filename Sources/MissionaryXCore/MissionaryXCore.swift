@@ -212,6 +212,18 @@ public struct MissionaryXAPIError: Error, LocalizedError, Equatable, Sendable {
         type: "not_found",
         message: "The requested endpoint does not exist"
     )
+
+    public static let unsupportedModelFile = MissionaryXAPIError(
+        statusCode: 400,
+        type: "unsupported_model_file",
+        message: "Only .gguf model files can be imported"
+    )
+
+    public static let modelFileAccessDenied = MissionaryXAPIError(
+        statusCode: 403,
+        type: "model_file_access_denied",
+        message: "The selected model file could not be opened for reading"
+    )
 }
 
 public struct APIErrorEnvelope: Codable, Equatable, Sendable {
@@ -756,6 +768,35 @@ public enum ModelOutputSanitizer {
             throw MissionaryXAPIError.emptyModelOutput
         }
         return cleaned
+    }
+}
+
+public enum LocalModelImport {
+    public static let allowedFileExtension = "gguf"
+
+    /// Accepts only the last path component of a locally selected model file.
+    /// The check is deliberately independent of the picker's content-type
+    /// filter so an imported file is accepted on its own name alone.
+    public static func isAcceptedModelFilename(_ filename: String) -> Bool {
+        guard !filename.isEmpty,
+              !filename.contains("\0"),
+              !filename.contains("/") else {
+            return false
+        }
+
+        let suffix = ".\(allowedFileExtension)"
+        guard filename.count > suffix.count else {
+            return false
+        }
+
+        let tail = filename.suffix(suffix.count)
+        return tail.lowercased() == suffix
+    }
+
+    public static func validate(filename: String) throws {
+        guard isAcceptedModelFilename(filename) else {
+            throw MissionaryXAPIError.unsupportedModelFile
+        }
     }
 }
 

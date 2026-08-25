@@ -23,6 +23,7 @@ class LlamaState: ObservableObject {
 
     private var llamaContext: LlamaContext?
     private var loadedModel: LoadedModelMetadata?
+    private var importedModelScope: URL?
     private let operationGate = WorkerOperationGate()
     private let apiKeyStore = APIKeyStore()
 
@@ -136,6 +137,13 @@ class LlamaState: ObservableObject {
         // lifetime is process-owned, so destroying the old context cannot tear
         // down global backend state beneath the new context.
         llamaContext = newContext
+
+        // The replaced context was the only thing that could still have the
+        // previously imported file mapped, so its security scope is now safe
+        // to close. A file imported by this call re-opens its own scope after
+        // loadModel returns.
+        releaseImportedModelScope()
+
         loadedModel = LoadedModelMetadata(
             filename: modelUrl.lastPathComponent,
             description: description,
@@ -143,6 +151,37 @@ class LlamaState: ObservableObject {
         )
         messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
         updateDownloadedModels(modelName: modelUrl.lastPathComponent)
+    }
+
+    // Loads a .gguf file the user picked from the Files app in place, without
+    // copying it into the app sandbox. The picked URL is security scoped and
+    // llama.cpp keeps the file mapped for as long as the model is loaded, so
+    // the scope is held open past the load and closed only when the model is
+    // replaced.
+    func loadLocalModel(at fileURL: URL) async throws {
+        try LocalModelImport.validate(filename: fileURL.lastPathComponent)
+
+        guard fileURL.startAccessingSecurityScopedResource() else {
+            throw MissionaryXAPIError.modelFileAccessDenied
+        }
+
+        var scopeRetained = false
+        defer {
+            if !scopeRetained {
+                fileURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        try await loadModel(modelUrl: fileURL)
+
+        importedModelScope = fileURL
+        scopeRetained = true
+    }
+
+    private func releaseImportedModelScope() {
+        guard let scope = importedModelScope else { return }
+        importedModelScope = nil
+        scope.stopAccessingSecurityScopedResource()
     }
 
     private func updateDownloadedModels(modelName: String) {

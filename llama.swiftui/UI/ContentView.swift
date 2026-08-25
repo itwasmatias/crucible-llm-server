@@ -155,6 +155,12 @@ struct ContentView: View {
         }
         var body: some View {
             List {
+                Section(
+                    header: Text("Load A Local Model"),
+                    footer: Text("Loads a .gguf file already on this device from the Files app. The file is used in place and is not downloaded again.")
+                ) {
+                    LoadCustomButton(llamaState: llamaState)
+                }
                 Section(header: Text("Download Models From Hugging Face")) {
                     HStack {
                         InputButton(llamaState: llamaState)
@@ -187,6 +193,8 @@ struct ContentView: View {
                             Text("1. Make sure the model is in GGUF Format")
                                     .padding()
                             Text("2. Copy the download link of the quantized model")
+                                    .padding()
+                            Text("3. Or, if the .gguf file is already on this device, use Load A Local Model to pick it from the Files app")
                                     .padding()
                         }
                         Spacer()

@@ -466,4 +466,56 @@ final class MissionaryXCoreTests: XCTestCase {
             XCTFail("Expected malformed_request")
         }
     }
+
+    // MARK: - Local GGUF import
+
+    func testLocalImportAcceptsGGUFFilenames() {
+        XCTAssertTrue(LocalModelImport.isAcceptedModelFilename("tinyllama-1.1b-chat-v1.0.Q8_0.gguf"))
+        XCTAssertTrue(LocalModelImport.isAcceptedModelFilename("a.gguf"))
+        XCTAssertTrue(LocalModelImport.isAcceptedModelFilename("model.GGUF"))
+        XCTAssertTrue(LocalModelImport.isAcceptedModelFilename("model with spaces.GgUf"))
+        XCTAssertTrue(LocalModelImport.isAcceptedModelFilename("model.bin.gguf"))
+        XCTAssertNoThrow(try LocalModelImport.validate(filename: "phi-2-q4_0.gguf"))
+    }
+
+    func testLocalImportRejectsNonGGUFFilenames() {
+        let rejected = [
+            "",
+            ".gguf",
+            "model",
+            "model.bin",
+            "model.gguf.bin",
+            "model.ggufx",
+            "gguf",
+            "models/model.gguf",
+            "model.gguf\u{0}",
+            "model\u{0}.gguf",
+        ]
+
+        for filename in rejected {
+            XCTAssertFalse(
+                LocalModelImport.isAcceptedModelFilename(filename),
+                "Expected \(filename) to be rejected"
+            )
+            assertAPIError(.unsupportedModelFile) {
+                try LocalModelImport.validate(filename: filename)
+            }
+        }
+    }
+
+    func testLocalImportErrorsAreDistinctAndNonSuccess() {
+        XCTAssertEqual(MissionaryXAPIError.unsupportedModelFile.statusCode, 400)
+        XCTAssertEqual(MissionaryXAPIError.unsupportedModelFile.type, "unsupported_model_file")
+        XCTAssertEqual(MissionaryXAPIError.modelFileAccessDenied.statusCode, 403)
+        XCTAssertEqual(MissionaryXAPIError.modelFileAccessDenied.type, "model_file_access_denied")
+        XCTAssertNotEqual(
+            MissionaryXAPIError.unsupportedModelFile,
+            MissionaryXAPIError.modelFileAccessDenied
+        )
+        XCTAssertEqual(
+            MissionaryXAPIError.unsupportedModelFile.errorDescription,
+            "Only .gguf model files can be imported"
+        )
+        XCTAssertEqual(LocalModelImport.allowedFileExtension, "gguf")
+    }
 }

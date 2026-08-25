@@ -18,15 +18,21 @@ class LlamaState: ObservableObject {
 
     @Published var serverRunning = false
     @Published var serverAddress = ""
+    @Published private(set) var apiKeyConfigured = false
     let httpServer = HTTPServer(port: 8080)
 
     private var llamaContext: LlamaContext?
-    private var defaultModelUrl: URL? {
-        Bundle.main.url(forResource: "ggml-model", withExtension: "gguf", subdirectory: "models")
-        // Bundle.main.url(forResource: "llama-2-7b-chat", withExtension: "Q2_K.gguf", subdirectory: "models")
-    }
+    private var loadedModel: LoadedModelMetadata?
+    private let operationGate = WorkerOperationGate()
+    private let apiKeyStore = APIKeyStore()
 
     init() {
+        do {
+            apiKeyConfigured = try apiKeyStore.load() != nil
+        } catch {
+            apiKeyConfigured = false
+            messageLog += "Secure API key storage is unavailable\n"
+        }
         loadModelsFromDisk()
         loadDefaultModels()
     }
@@ -45,12 +51,6 @@ class LlamaState: ObservableObject {
     }
 
     private func loadDefaultModels() {
-        do {
-            try loadModel(modelUrl: defaultModelUrl)
-        } catch {
-            messageLog += "Error!\n"
-        }
-
         for model in defaultModels {
             let fileURL = getDocumentsDirectory().appendingPathComponent(model.filename)
             if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -114,98 +114,189 @@ class LlamaState: ObservableObject {
             filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
         )
     ]
-    func loadModel(modelUrl: URL?) throws {
-        if let modelUrl {
-            messageLog += "Loading model...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path())
-            messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
-            // Assuming that the model is successfully loaded, update the downloaded models
-            updateDownloadedModels(modelName: modelUrl.lastPathComponent, status: "downloaded")
-        } else {
+    func loadModel(modelUrl: URL?) async throws {
+        guard let modelUrl else {
             messageLog += "Load a model from the list below\n"
+            return
+        }
+        guard let lease = operationGate.tryAcquire(.modelLoad) else {
+            throw MissionaryXAPIError.workerBusy
+        }
+        defer { _ = operationGate.release(lease) }
+
+        messageLog += "Loading model...\n"
+        let modelPath = modelUrl.path()
+        let newContext = try await Task.detached(priority: .userInitiated) {
+            try LlamaContext.create_context(path: modelPath)
+        }.value
+        let description = await newContext.model_info()
+
+        // Replace only after the new context is fully initialized. Llama backend
+        // lifetime is process-owned, so destroying the old context cannot tear
+        // down global backend state beneath the new context.
+        llamaContext = newContext
+        loadedModel = LoadedModelMetadata(
+            filename: modelUrl.lastPathComponent,
+            description: description,
+            ready: true
+        )
+        messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
+        updateDownloadedModels(modelName: modelUrl.lastPathComponent)
+    }
+
+    private func updateDownloadedModels(modelName: String) {
+        undownloadedModels.removeAll {
+            $0.filename == modelName
         }
     }
 
-
-    private func updateDownloadedModels(modelName: String, status: String) {
-        undownloadedModels.removeAll { $0.name == modelName }
-    }
-
-
     func complete(text: String) async {
+        guard let lease = operationGate.tryAcquire(.inference) else {
+            messageLog += "Worker busy\n"
+            return
+        }
+        defer { _ = operationGate.release(lease) }
+
         guard let llamaContext else {
+            messageLog += "No model loaded\n"
             return
         }
 
-        let t_start = DispatchTime.now().uptimeNanoseconds
-        await llamaContext.completion_init(text: text)
-        let t_heat_end = DispatchTime.now().uptimeNanoseconds
-        let t_heat = Double(t_heat_end - t_start) / NS_PER_S
+        let maximumTokens = MissionaryXLimits.maximumOutputTokens
+        let start = DispatchTime.now().uptimeNanoseconds
+        do {
+            try await llamaContext.completion_init(
+                text: text,
+                maxTokens: maximumTokens
+            )
+            let initialized = DispatchTime.now().uptimeNanoseconds
+            var rawOutput = ""
+            var generatedTokens = 0
 
-        messageLog += "\(text)"
-
-        Task.detached {
-            while await !llamaContext.is_done {
-                let result = await llamaContext.completion_loop()
-                await MainActor.run {
-                    self.messageLog += "\(result)"
+            generationLoop: while generatedTokens < maximumTokens {
+                switch try await llamaContext.completion_loop() {
+                case .token(let piece):
+                    rawOutput += piece
+                    generatedTokens += 1
+                case .finished(_, let trailingText):
+                    rawOutput += trailingText
+                    break generationLoop
                 }
             }
 
-            let t_end = DispatchTime.now().uptimeNanoseconds
-            let t_generation = Double(t_end - t_heat_end) / self.NS_PER_S
-            let tokens_per_second = Double(await llamaContext.n_len) / t_generation
-
             await llamaContext.clear()
+            let cleaned = try ModelOutputSanitizer.sanitize(rawOutput)
+            let end = DispatchTime.now().uptimeNanoseconds
+            let warmup = Double(initialized - start) / NS_PER_S
+            let generation = max(Double(end - initialized) / NS_PER_S, 0.001)
+            let tokensPerSecond = Double(generatedTokens) / generation
 
-            await MainActor.run {
-                self.messageLog += """
-                    \n
-                    Done
-                    Heat up took \(t_heat)s
-                    Generated \(tokens_per_second) t/s\n
-                    """
-            }
+            messageLog += "\(text)\(cleaned)\n"
+            messageLog += "Done\n"
+            messageLog += "Heat up took \(warmup)s\n"
+            messageLog += "Generated \(tokensPerSecond) t/s\n"
+        } catch {
+            await llamaContext.clear()
+            messageLog += "Completion failed: \(error.localizedDescription)\n"
         }
     }
 
     func bench() async {
+        guard let lease = operationGate.tryAcquire(.benchmark) else {
+            messageLog += "Worker busy\n"
+            return
+        }
+        defer { _ = operationGate.release(lease) }
+
         guard let llamaContext else {
+            messageLog += "No model loaded\n"
             return
         }
 
-        messageLog += "\n"
-        messageLog += "Running benchmark...\n"
-        messageLog += "Model info: "
-        messageLog += await llamaContext.model_info() + "\n"
+        do {
+            messageLog += "\nRunning benchmark...\nModel info: "
+            messageLog += await llamaContext.model_info() + "\n"
 
-        let t_start = DispatchTime.now().uptimeNanoseconds
-        let _ = await llamaContext.bench(pp: 8, tg: 4, pl: 1) // heat up
-        let t_end = DispatchTime.now().uptimeNanoseconds
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try await llamaContext.bench(pp: 8, tg: 4, pl: 1)
+            let end = DispatchTime.now().uptimeNanoseconds
+            let warmup = Double(end - start) / NS_PER_S
+            messageLog += "Heat up time: \(warmup) seconds\n"
 
-        let t_heat = Double(t_end - t_start) / NS_PER_S
-        messageLog += "Heat up time: \(t_heat) seconds, please wait...\n"
+            if warmup > 5.0 {
+                messageLog += "Heat up time is too long, aborting benchmark\n"
+                return
+            }
 
-        // if more than 5 seconds, then we're probably running on a slow device
-        if t_heat > 5.0 {
-            messageLog += "Heat up time is too long, aborting benchmark\n"
-            return
+            messageLog += try await llamaContext.bench(
+                pp: 512,
+                tg: 128,
+                pl: 1,
+                nr: 3
+            )
+            messageLog += "\n"
+        } catch {
+            messageLog += "Benchmark failed: \(error.localizedDescription)\n"
         }
-
-        let result = await llamaContext.bench(pp: 512, tg: 128, pl: 1, nr: 3)
-
-        messageLog += "\(result)"
-        messageLog += "\n"
     }
 
     func clear() async {
-        guard let llamaContext else {
+        guard let lease = operationGate.tryAcquire(.maintenance) else {
+            messageLog += "Worker busy\n"
             return
         }
+        defer { _ = operationGate.release(lease) }
 
-        await llamaContext.clear()
+        if let llamaContext {
+            await llamaContext.clear()
+        }
         messageLog = ""
+    }
+
+    // MARK: - Authentication
+
+    func saveAPIKey(_ key: String) throws {
+        guard !serverRunning else {
+            throw MissionaryXAPIError.workerBusy
+        }
+        try apiKeyStore.save(key)
+        apiKeyConfigured = true
+        messageLog += "API key saved securely\n"
+    }
+
+    func clearAPIKey() throws {
+        guard !serverRunning else {
+            throw MissionaryXAPIError.workerBusy
+        }
+        try apiKeyStore.delete()
+        apiKeyConfigured = false
+        messageLog += "API key removed\n"
+    }
+
+    // MARK: - Worker state
+
+    func tryBeginInference() -> WorkerOperationLease? {
+        operationGate.tryAcquire(.inference)
+    }
+
+    func endOperation(_ lease: WorkerOperationLease) {
+        if !operationGate.release(lease) {
+            print("Worker operation lease release mismatch")
+        }
+    }
+
+    func modelsResponse() -> ModelsResponse {
+        ModelsResponse(
+            model: loadedModel,
+            operation: operationGate.snapshot()
+        )
+    }
+
+    func isReadyForInference() -> Bool {
+        llamaContext != nil
+            && loadedModel != nil
+            && !operationGate.snapshot().isBusy
     }
 
     // MARK: - HTTP Server
@@ -216,54 +307,73 @@ class LlamaState: ObservableObject {
             serverRunning = false
             serverAddress = ""
             messageLog += "Server stopped\n"
-        } else {
-            do {
-                try httpServer.start(llamaState: self)
-                serverRunning = true
-                let ip = httpServer.getLocalIP()
-                serverAddress = "http://\(ip):8080"
-                messageLog += "Server started at \(serverAddress)\n"
-            } catch {
-                messageLog += "Failed to start server: \(error)\n"
+            return
+        }
+
+        do {
+            guard let apiKey = try apiKeyStore.load(), !apiKey.isEmpty else {
+                apiKeyConfigured = false
+                messageLog += "Configure an API key before starting the server\n"
+                return
             }
+            try httpServer.start(llamaState: self, apiKey: apiKey)
+            apiKeyConfigured = true
+            serverRunning = true
+            let ip = httpServer.getLocalIP()
+            serverAddress = "http://\(ip):8080"
+            messageLog += "Server started at \(serverAddress)\n"
+        } catch {
+            messageLog += "Failed to start server: \(error.localizedDescription)\n"
         }
     }
 
-    // Non-streaming completion for API use
-    func completeForAPI(text: String, maxTokens: Int = 500) async -> String {
+    // The caller must hold the exact inference lease for the entire operation.
+    func completeForAPI(
+        text: String,
+        maxTokens: Int,
+        lease: WorkerOperationLease
+    ) async throws -> CompletionResult {
+        guard lease.kind == .inference, operationGate.owns(lease) else {
+            throw MissionaryXAPIError.workerBusy
+        }
         guard let llamaContext else {
-            return "Error: No model loaded"
+            throw MissionaryXAPIError.modelNotLoaded
         }
 
-        await llamaContext.completion_init(text: text)
-        var result = ""
-        var tokenCount = 0
+        var rawOutput = ""
+        var generatedTokens = 0
+        var termination = CompletionTermination.maximumTokens
 
-        while await !llamaContext.is_done && tokenCount < maxTokens {
-            let piece = await llamaContext.completion_loop()
-            result += piece
-            tokenCount += 1
-        }
+        do {
+            try await llamaContext.completion_init(
+                text: text,
+                maxTokens: maxTokens,
+                parseSpecialTokens: true
+            )
 
-        await llamaContext.clear()
-
-        // Strip <think>...</think> blocks from Qwen-style reasoning models
-        var cleaned = result
-        if let thinkStart = cleaned.range(of: "<think>") {
-            if let thinkEnd = cleaned.range(of: "</think>") {
-                // Full think block — take everything after it
-                cleaned = String(cleaned[thinkEnd.upperBound...])
-            } else {
-                // Think block consumed all tokens — take everything before it
-                cleaned = String(cleaned[..<thinkStart.lowerBound])
+            generationLoop: while generatedTokens < maxTokens {
+                switch try await llamaContext.completion_loop() {
+                case .token(let piece):
+                    rawOutput += piece
+                    generatedTokens += 1
+                case .finished(let reason, let trailingText):
+                    rawOutput += trailingText
+                    termination = reason
+                    break generationLoop
+                }
             }
+            await llamaContext.clear()
+        } catch let apiError as MissionaryXAPIError {
+            await llamaContext.clear()
+            throw apiError
+        } catch {
+            await llamaContext.clear()
+            throw MissionaryXAPIError.inferenceFailed
         }
 
-        // Stop at first <|im_end|> — model may echo the prompt in a loop
-        if let endTag = cleaned.range(of: "<|im_end|>") {
-            cleaned = String(cleaned[..<endTag.lowerBound])
-        }
-
-        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CompletionResult(
+            content: try ModelOutputSanitizer.sanitize(rawOutput),
+            finishReason: termination.finishReason
+        )
     }
 }

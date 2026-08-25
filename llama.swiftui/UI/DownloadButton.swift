@@ -89,10 +89,12 @@ struct DownloadButton: View {
                         download()
                         return
                     }
-                    do {
-                        try llamaState.loadModel(modelUrl: fileURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                    Task {
+                        do {
+                            try await llamaState.loadModel(modelUrl: fileURL)
+                        } catch {
+                            llamaState.messageLog += "Model load failed: \(error.localizedDescription)\n"
+                        }
                     }
                 }) {
                     Text("Load \(modelName)")

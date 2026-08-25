@@ -3,7 +3,9 @@ import SwiftUI
 struct ContentView: View {
     @StateObject var llamaState = LlamaState()
     @State private var multiLineText = ""
-    @State private var showingHelp = false    // To track if Help Sheet should be shown
+    @State private var showingHelp = false
+    @State private var apiKeyInput = ""
+    @State private var apiKeyStatus = ""
 
     var body: some View {
         NavigationView {
@@ -42,6 +44,46 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .padding()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("MissionaryX API key", text: $apiKeyInput)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+
+                    HStack {
+                        Button("Save API Key") {
+                            do {
+                                try llamaState.saveAPIKey(apiKeyInput)
+                                apiKeyInput = ""
+                                apiKeyStatus = "API key configured"
+                            } catch {
+                                apiKeyStatus = error.localizedDescription
+                            }
+                        }
+
+                        Button("Remove API Key") {
+                            do {
+                                try llamaState.clearAPIKey()
+                                apiKeyInput = ""
+                                apiKeyStatus = "API key removed"
+                            } catch {
+                                apiKeyStatus = error.localizedDescription
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+
+                    Text(
+                        apiKeyStatus.isEmpty
+                            ? (llamaState.apiKeyConfigured
+                                ? "API key configured"
+                                : "API key required before server start")
+                            : apiKeyStatus
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                }
+                .padding(.horizontal)
 
                 HStack {
                     Button(llamaState.serverRunning ? "Stop Server" : "Start Server") {

@@ -1,11 +1,41 @@
 import Foundation
 import Network
 
-/// Minimal HTTP server that serves an OpenAI-compatible chat completions API
-class HTTPServer {
+/// Bounded HTTP/1.1 server for controlled MissionaryX device testing.
+///
+/// This intentionally supports one request per connection, no chunked transfer,
+/// no streaming responses, and no persistent connections.
+final class HTTPServer {
+    private struct ChatCompletionResponse: Encodable {
+        struct Choice: Encodable {
+            struct Message: Encodable {
+                let role: String
+                let content: String
+            }
+
+            let index: Int
+            let message: Message
+            let finishReason: String
+
+            enum CodingKeys: String, CodingKey {
+                case index
+                case message
+                case finishReason = "finish_reason"
+            }
+        }
+
+        let id: String
+        let object: String
+        let created: Int
+        let model: String
+        let choices: [Choice]
+    }
+
     private var listener: NWListener?
     private let port: UInt16
+    private let configurationLock = NSLock()
     private weak var llamaState: LlamaState?
+    private var apiKey: String?
 
     var isRunning: Bool { listener != nil }
 
@@ -13,39 +43,68 @@ class HTTPServer {
         self.port = port
     }
 
-    func start(llamaState: LlamaState) throws {
-        self.llamaState = llamaState
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
-        listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-        listener?.newConnectionHandler = { [weak self] conn in
-            self?.handleConnection(conn)
+    func start(llamaState: LlamaState, apiKey: String) throws {
+        guard listener == nil, !apiKey.isEmpty else {
+            throw MissionaryXAPIError.workerNotReady
         }
-        listener?.start(queue: .global(qos: .userInitiated))
-        print("HTTP Server started on port \(port)")
+
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let newListener = try NWListener(
+            using: parameters,
+            on: NWEndpoint.Port(rawValue: port)!
+        )
+        newListener.newConnectionHandler = { [weak self] connection in
+            self?.handleConnection(connection)
+        }
+        newListener.stateUpdateHandler = { state in
+            switch state {
+            case .failed(let error):
+                print("HTTP server listener failed: \(error.localizedDescription)")
+            case .ready:
+                print("HTTP server listener ready")
+            default:
+                break
+            }
+        }
+        setConfiguration(llamaState: llamaState, apiKey: apiKey)
+        listener = newListener
+        newListener.start(queue: .global(qos: .userInitiated))
+        print("HTTP server starting on port \(port)")
     }
 
     func stop() {
         listener?.cancel()
         listener = nil
-        print("HTTP Server stopped")
+        clearConfiguration()
+        print("HTTP server stopped")
     }
 
     func getLocalIP() -> String {
         var address = "127.0.0.1"
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&ifaddr) == 0 {
-            var ptr = ifaddr
-            while ptr != nil {
-                defer { ptr = ptr?.pointee.ifa_next }
-                guard let interface = ptr?.pointee else { continue }
-                let addrFamily = interface.ifa_addr.pointee.sa_family
-                if addrFamily == UInt8(AF_INET) {
+            var pointer = ifaddr
+            while pointer != nil {
+                defer { pointer = pointer?.pointee.ifa_next }
+                guard let interface = pointer?.pointee else { continue }
+                let addressFamily = interface.ifa_addr.pointee.sa_family
+                if addressFamily == UInt8(AF_INET) {
                     let name = String(cString: interface.ifa_name)
                     if name == "en0" || name == "en1" {
-                        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                                    &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                        var hostname = [CChar](
+                            repeating: 0,
+                            count: Int(NI_MAXHOST)
+                        )
+                        getnameinfo(
+                            interface.ifa_addr,
+                            socklen_t(interface.ifa_addr.pointee.sa_len),
+                            &hostname,
+                            socklen_t(hostname.count),
+                            nil,
+                            0,
+                            NI_NUMERICHOST
+                        )
                         address = String(cString: hostname)
                     }
                 }
@@ -56,147 +115,401 @@ class HTTPServer {
     }
 
     private func handleConnection(_ connection: NWConnection) {
+        let accumulator = HTTPRequestAccumulator()
         connection.start(queue: .global(qos: .userInitiated))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self = self, let data = data, error == nil else {
+        receiveNext(on: connection, accumulator: accumulator)
+    }
+
+    private func receiveNext(
+        on connection: NWConnection,
+        accumulator: HTTPRequestAccumulator
+    ) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: 8 * 1024
+        ) { [weak self] data, _, streamEnded, error in
+            guard let self else {
                 connection.cancel()
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
-            self.routeRequest(request, connection: connection)
-        }
-    }
-
-    private func routeRequest(_ request: String, connection: NWConnection) {
-        let lines = request.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Bad Request\"}")
-            return
-        }
-
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 2 else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Bad Request\"}")
-            return
-        }
-
-        let method = parts[0]
-        let path = parts[1]
-
-        // CORS headers for all responses
-        if method == "OPTIONS" {
-            sendResponse(connection: connection, status: "200 OK", body: "", extraHeaders: [
-                "Access-Control-Allow-Origin: *",
-                "Access-Control-Allow-Methods: GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers: Content-Type, Authorization"
-            ])
-            return
-        }
-
-        switch path {
-        case "/":
-            sendResponse(connection: connection, status: "200 OK", body: "Crucible LLM Server is running")
-        case "/v1/models", "/api/tags":
-            handleModels(connection: connection)
-        case "/v1/chat/completions":
-            if method == "POST" {
-                handleChatCompletion(request: request, connection: connection)
-            } else {
-                sendResponse(connection: connection, status: "405 Method Not Allowed", body: "{\"error\":\"Method Not Allowed\"}")
-            }
-        default:
-            sendResponse(connection: connection, status: "404 Not Found", body: "{\"error\":\"Not Found\"}")
-        }
-    }
-
-    private func handleModels(connection: NWConnection) {
-        let response = """
-        {"object":"list","data":[{"id":"local","object":"model","created":0,"owned_by":"local"}]}
-        """
-        sendResponse(connection: connection, status: "200 OK", body: response, contentType: "application/json")
-    }
-
-    private func handleChatCompletion(request: String, connection: NWConnection) {
-        // Extract JSON body from HTTP request
-        guard let bodyStart = request.range(of: "\r\n\r\n")?.upperBound else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"No body\"}", contentType: "application/json")
-            return
-        }
-
-        let bodyString = String(request[bodyStart...])
-        guard let bodyData = bodyString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
-              let messages = json["messages"] as? [[String: Any]] else {
-            sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Invalid JSON\"}", contentType: "application/json")
-            return
-        }
-
-        // Build prompt using ChatML format (works with Qwen, Gemma, most chat models)
-        // Inject /no_think by default unless the caller explicitly includes a system message
-        var prompt = ""
-        let hasSystemMessage = messages.contains { ($0["role"] as? String) == "system" }
-        if !hasSystemMessage {
-            prompt += "<|im_start|>system\n/no_think\nBe concise and helpful.<|im_end|>\n"
-        }
-        for msg in messages {
-            let role = msg["role"] as? String ?? "user"
-            let content = msg["content"] as? String ?? ""
-            prompt += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
-        }
-        prompt += "<|im_start|>assistant\n"
-
-        let maxTokens = json["max_tokens"] as? Int ?? 500
-
-        // Run inference on a background thread
-        Task {
-            guard let llamaState = await self.llamaState else {
-                self.sendResponse(connection: connection, status: "500 Internal Server Error",
-                                  body: "{\"error\":\"No model loaded\"}", contentType: "application/json")
+            if error != nil {
+                connection.cancel()
                 return
             }
 
-            let result = await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens)
-
-            let responseJSON: [String: Any] = [
-                "id": "chatcmpl-\(UUID().uuidString.prefix(8))",
-                "object": "chat.completion",
-                "created": Int(Date().timeIntervalSince1970),
-                "model": "local",
-                "choices": [[
-                    "index": 0,
-                    "message": [
-                        "role": "assistant",
-                        "content": result
-                    ],
-                    "finish_reason": "stop"
-                ]]
-            ]
-
-            if let jsonData = try? JSONSerialization.data(withJSONObject: responseJSON),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                self.sendResponse(connection: connection, status: "200 OK", body: jsonString, contentType: "application/json")
-            } else {
-                self.sendResponse(connection: connection, status: "500 Internal Server Error",
-                                  body: "{\"error\":\"Failed to serialize response\"}", contentType: "application/json")
+            let result = accumulator.append(
+                data ?? Data(),
+                streamEnded: streamEnded
+            )
+            switch result {
+            case .needMoreData:
+                self.receiveNext(
+                    on: connection,
+                    accumulator: accumulator
+                )
+            case .failure(let apiError):
+                self.sendError(
+                    connection: connection,
+                    error: apiError
+                )
+            case .complete(let request):
+                self.routeRequest(
+                    request,
+                    connection: connection
+                )
             }
         }
     }
 
-    private func sendResponse(connection: NWConnection, status: String, body: String,
-                              contentType: String = "text/plain", extraHeaders: [String] = []) {
-        var headers = "HTTP/1.1 \(status)\r\n"
-        headers += "Content-Type: \(contentType)\r\n"
-        headers += "Content-Length: \(body.utf8.count)\r\n"
-        headers += "Access-Control-Allow-Origin: *\r\n"
-        headers += "Connection: close\r\n"
-        for header in extraHeaders {
-            headers += "\(header)\r\n"
+    private func routeRequest(
+        _ request: ParsedHTTPRequest,
+        connection: NWConnection
+    ) {
+        if request.method == "OPTIONS" {
+            sendResponse(
+                connection: connection,
+                statusCode: 204,
+                body: Data(),
+                contentType: "text/plain",
+                extraHeaders: ["Allow": "GET, POST, OPTIONS"]
+            )
+            return
         }
-        headers += "\r\n"
 
-        let responseData = (headers + body).data(using: .utf8)!
-        connection.send(content: responseData, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        let configuration = configurationSnapshot()
+        guard let apiKey = configuration.apiKey,
+              BearerAuthenticator.validate(
+                headers: request.headers,
+                expectedKey: apiKey
+              ) == nil else {
+            sendError(
+                connection: connection,
+                error: .unauthorized,
+                extraHeaders: ["WWW-Authenticate": "Bearer"]
+            )
+            return
+        }
+
+        switch request.path {
+        case "/":
+            guard request.method == "GET" else {
+                sendError(connection: connection, error: .methodNotAllowed)
+                return
+            }
+            sendResponse(
+                connection: connection,
+                statusCode: 200,
+                body: Data("Crucible LLM Server is running".utf8),
+                contentType: "text/plain"
+            )
+
+        case "/health":
+            guard request.method == "GET" else {
+                sendError(connection: connection, error: .methodNotAllowed)
+                return
+            }
+            sendJSON(
+                connection: connection,
+                statusCode: 200,
+                value: HealthResponse(status: "ok")
+            )
+
+        case "/ready":
+            guard request.method == "GET" else {
+                sendError(connection: connection, error: .methodNotAllowed)
+                return
+            }
+            guard let llamaState = configuration.llamaState else {
+                sendError(connection: connection, error: .workerNotReady)
+                return
+            }
+            handleReadiness(
+                llamaState: llamaState,
+                connection: connection
+            )
+
+        case "/v1/models":
+            guard request.method == "GET" else {
+                sendError(connection: connection, error: .methodNotAllowed)
+                return
+            }
+            guard let llamaState = configuration.llamaState else {
+                sendError(connection: connection, error: .workerNotReady)
+                return
+            }
+            handleModels(
+                llamaState: llamaState,
+                connection: connection
+            )
+
+        case "/v1/chat/completions":
+            guard request.method == "POST" else {
+                sendError(connection: connection, error: .methodNotAllowed)
+                return
+            }
+            guard isJSONContentType(request.headers["content-type"]) else {
+                sendError(
+                    connection: connection,
+                    error: MissionaryXAPIError(
+                        statusCode: 415,
+                        type: "unsupported_media_type",
+                        message: "Content-Type must be application/json"
+                    )
+                )
+                return
+            }
+            guard let llamaState = configuration.llamaState else {
+                sendError(connection: connection, error: .workerNotReady)
+                return
+            }
+            handleChatCompletion(
+                body: request.body,
+                llamaState: llamaState,
+                connection: connection
+            )
+
+        default:
+            sendError(connection: connection, error: .notFound)
+        }
+    }
+
+    private func handleModels(
+        llamaState: LlamaState,
+        connection: NWConnection
+    ) {
+        Task { [weak self] in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            let response = await llamaState.modelsResponse()
+            self.sendJSON(
+                connection: connection,
+                statusCode: 200,
+                value: response
+            )
+        }
+    }
+
+    private func handleReadiness(
+        llamaState: LlamaState,
+        connection: NWConnection
+    ) {
+        Task { [weak self] in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            guard await llamaState.isReadyForInference() else {
+                self.sendError(
+                    connection: connection,
+                    error: .workerNotReady
+                )
+                return
+            }
+            self.sendJSON(
+                connection: connection,
+                statusCode: 200,
+                value: ReadyResponse()
+            )
+        }
+    }
+
+    private func handleChatCompletion(
+        body: Data,
+        llamaState: LlamaState,
+        connection: NWConnection
+    ) {
+        let validatedRequest: ValidatedChatRequest
+        do {
+            validatedRequest = try ChatRequestValidator.validate(body: body)
+        } catch let apiError as MissionaryXAPIError {
+            sendError(connection: connection, error: apiError)
+            return
+        } catch {
+            sendError(connection: connection, error: .malformedJSON)
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            guard let lease = await llamaState.tryBeginInference() else {
+                self.sendError(
+                    connection: connection,
+                    error: .workerBusy
+                )
+                return
+            }
+
+            do {
+                let result = try await llamaState.completeForAPI(
+                    text: validatedRequest.renderedPrompt,
+                    maxTokens: validatedRequest.maxTokens,
+                    lease: lease
+                )
+                await llamaState.endOperation(lease)
+
+                let response = ChatCompletionResponse(
+                    id: "chatcmpl-\(UUID().uuidString.prefix(8))",
+                    object: "chat.completion",
+                    created: Int(Date().timeIntervalSince1970),
+                    model: "local",
+                    choices: [
+                        ChatCompletionResponse.Choice(
+                            index: 0,
+                            message: .init(
+                                role: "assistant",
+                                content: result.content
+                            ),
+                            finishReason: result.finishReason.rawValue
+                        ),
+                    ]
+                )
+                self.sendJSON(
+                    connection: connection,
+                    statusCode: 200,
+                    value: response
+                )
+            } catch let apiError as MissionaryXAPIError {
+                await llamaState.endOperation(lease)
+                self.sendError(
+                    connection: connection,
+                    error: apiError
+                )
+            } catch {
+                await llamaState.endOperation(lease)
+                self.sendError(
+                    connection: connection,
+                    error: .inferenceFailed
+                )
+            }
+        }
+    }
+
+    private func setConfiguration(llamaState: LlamaState, apiKey: String) {
+        configurationLock.lock()
+        self.llamaState = llamaState
+        self.apiKey = apiKey
+        configurationLock.unlock()
+    }
+
+    private func isJSONContentType(_ value: String?) -> Bool {
+        guard let value,
+              let mediaType = value.split(
+                  separator: ";",
+                  maxSplits: 1,
+                  omittingEmptySubsequences: false
+              ).first else {
+            return false
+        }
+        return String(mediaType)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "application/json"
+    }
+
+    private func clearConfiguration() {
+        configurationLock.lock()
+        llamaState = nil
+        apiKey = nil
+        configurationLock.unlock()
+    }
+
+    private func configurationSnapshot() -> (
+        llamaState: LlamaState?,
+        apiKey: String?
+    ) {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        return (llamaState, apiKey)
+    }
+
+    private func sendJSON<T: Encodable>(
+        connection: NWConnection,
+        statusCode: Int,
+        value: T
+    ) {
+        do {
+            sendResponse(
+                connection: connection,
+                statusCode: statusCode,
+                body: try APIJSON.encode(value),
+                contentType: "application/json"
+            )
+        } catch {
+            sendError(
+                connection: connection,
+                error: MissionaryXAPIError(
+                    statusCode: 500,
+                    type: "serialization_failed",
+                    message: "Response serialization failed"
+                )
+            )
+        }
+    }
+
+    private func sendError(
+        connection: NWConnection,
+        error: MissionaryXAPIError,
+        extraHeaders: [String: String] = [:]
+    ) {
+        sendResponse(
+            connection: connection,
+            statusCode: error.statusCode,
+            body: APIJSON.encodeError(error),
+            contentType: "application/json",
+            extraHeaders: extraHeaders
+        )
+    }
+
+    private func sendResponse(
+        connection: NWConnection,
+        statusCode: Int,
+        body: Data,
+        contentType: String,
+        extraHeaders: [String: String] = [:]
+    ) {
+        var header = "HTTP/1.1 \(statusCode) \(reasonPhrase(for: statusCode))\r\n"
+        header += "Content-Type: \(contentType)\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Connection: close\r\n"
+        for name in extraHeaders.keys.sorted() {
+            if let value = extraHeaders[name] {
+                header += "\(name): \(value)\r\n"
+            }
+        }
+        header += "\r\n"
+
+        var response = Data(header.utf8)
+        response.append(body)
+        connection.send(
+            content: response,
+            completion: .contentProcessed { _ in
+                connection.cancel()
+            }
+        )
+    }
+
+    private func reasonPhrase(for statusCode: Int) -> String {
+        switch statusCode {
+        case 200: return "OK"
+        case 204: return "No Content"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 409: return "Conflict"
+        case 411: return "Length Required"
+        case 413: return "Payload Too Large"
+        case 415: return "Unsupported Media Type"
+        case 422: return "Unprocessable Content"
+        case 429: return "Too Many Requests"
+        case 431: return "Request Header Fields Too Large"
+        case 500: return "Internal Server Error"
+        case 503: return "Service Unavailable"
+        default: return "Error"
+        }
     }
 }

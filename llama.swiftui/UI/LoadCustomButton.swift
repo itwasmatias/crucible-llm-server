@@ -28,13 +28,14 @@ struct LoadCustomButton: View {
                     let gotAccess = file.startAccessingSecurityScopedResource()
                     if !gotAccess { return }
 
-                    do {
-                        try llamaState.loadModel(modelUrl: file.absoluteURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                    Task {
+                        defer { file.stopAccessingSecurityScopedResource() }
+                        do {
+                            try await llamaState.loadModel(modelUrl: file.absoluteURL)
+                        } catch {
+                            llamaState.messageLog += "Model load failed: \(error.localizedDescription)\n"
+                        }
                     }
-
-                    file.stopAccessingSecurityScopedResource()
                 }
             case .failure(let error):
                 print(error)

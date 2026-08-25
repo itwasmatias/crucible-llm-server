@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - name: Find and select Xcode with iOS SDK
@@ -22,6 +23,12 @@ jobs:
           echo "Using $XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH"
           xcodebuild -showsdks | grep -i ios
+
+      - name: Verify MissionaryX hardening invariants
+        run: ./Scripts/verify_missionaryx_hardening.sh
+
+      - name: Run MissionaryX core tests
+        run: swift test
 
       - name: Build llama.cpp xcframework
         run: |

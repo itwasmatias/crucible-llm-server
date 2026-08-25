@@ -5,39 +5,44 @@ struct LoadCustomButton: View {
     @ObservedObject private var llamaState: LlamaState
     @State private var showFileImporter = false
 
+    // The picker filters on the GGUF content type when the system can resolve
+    // one. Resolution is not guaranteed, so the selected file is validated by
+    // name as well and the filter is never the only thing enforcing GGUF.
+    private static let allowedContentTypes: [UTType] = {
+        if let gguf = UTType(filenameExtension: LocalModelImport.allowedFileExtension) {
+            return [gguf]
+        }
+        return [.data]
+    }()
+
     init(llamaState: LlamaState) {
         self.llamaState = llamaState
     }
 
     var body: some View {
-        VStack {
-            Button(action: {
-                showFileImporter = true
-            }) {
-                Text("Load Custom Model")
-            }
+        Button("Import .gguf From Files") {
+            showFileImporter = true
         }
         .fileImporter(
             isPresented: $showFileImporter,
-            allowedContentTypes: [UTType(filenameExtension: "gguf", conformingTo: .data)!],
+            allowedContentTypes: LoadCustomButton.allowedContentTypes,
             allowsMultipleSelection: false
         ) { result in
             switch result {
             case .success(let files):
-                files.forEach { file in
-                    let gotAccess = file.startAccessingSecurityScopedResource()
-                    if !gotAccess { return }
-
+                guard let file = files.first else {
+                    llamaState.messageLog += "No model file was selected\n"
+                    return
+                }
+                Task {
                     do {
-                        try llamaState.loadModel(modelUrl: file.absoluteURL)
-                    } catch let err {
-                        print("Error: \(err.localizedDescription)")
+                        try await llamaState.loadLocalModel(at: file.absoluteURL)
+                    } catch {
+                        llamaState.messageLog += "Model import failed: \(error.localizedDescription)\n"
                     }
-
-                    file.stopAccessingSecurityScopedResource()
                 }
             case .failure(let error):
-                print(error)
+                llamaState.messageLog += "Model import failed: \(error.localizedDescription)\n"
             }
         }
     }

@@ -3,7 +3,9 @@ import SwiftUI
 struct ContentView: View {
     @StateObject var llamaState = LlamaState()
     @State private var multiLineText = ""
-    @State private var showingHelp = false    // To track if Help Sheet should be shown
+    @State private var showingHelp = false
+    @State private var apiKeyInput = ""
+    @State private var apiKeyStatus = ""
 
     var body: some View {
         NavigationView {
@@ -42,6 +44,46 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .padding()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("MissionaryX API key", text: $apiKeyInput)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+
+                    HStack {
+                        Button("Save API Key") {
+                            do {
+                                try llamaState.saveAPIKey(apiKeyInput)
+                                apiKeyInput = ""
+                                apiKeyStatus = "API key configured"
+                            } catch {
+                                apiKeyStatus = error.localizedDescription
+                            }
+                        }
+
+                        Button("Remove API Key") {
+                            do {
+                                try llamaState.clearAPIKey()
+                                apiKeyInput = ""
+                                apiKeyStatus = "API key removed"
+                            } catch {
+                                apiKeyStatus = error.localizedDescription
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+
+                    Text(
+                        apiKeyStatus.isEmpty
+                            ? (llamaState.apiKeyConfigured
+                                ? "API key configured"
+                                : "API key required before server start")
+                            : apiKeyStatus
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                }
+                .padding(.horizontal)
 
                 HStack {
                     Button(llamaState.serverRunning ? "Stop Server" : "Start Server") {
@@ -113,6 +155,12 @@ struct ContentView: View {
         }
         var body: some View {
             List {
+                Section(
+                    header: Text("Load A Local Model"),
+                    footer: Text("Loads a .gguf file already on this device from the Files app. The file is used in place and is not downloaded again.")
+                ) {
+                    LoadCustomButton(llamaState: llamaState)
+                }
                 Section(header: Text("Download Models From Hugging Face")) {
                     HStack {
                         InputButton(llamaState: llamaState)
@@ -145,6 +193,8 @@ struct ContentView: View {
                             Text("1. Make sure the model is in GGUF Format")
                                     .padding()
                             Text("2. Copy the download link of the quantized model")
+                                    .padding()
+                            Text("3. Or, if the .gguf file is already on this device, use Load A Local Model to pick it from the Files app")
                                     .padding()
                         }
                         Spacer()

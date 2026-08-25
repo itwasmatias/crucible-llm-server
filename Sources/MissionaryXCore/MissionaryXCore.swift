@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 public enum MissionaryXLimits {
     public static let maximumHeaderBytes = 8 * 1024
@@ -583,7 +584,8 @@ public enum ChatRequestValidator {
     }
 
     private static func strictInteger(_ value: Any) -> Int? {
-        guard !(value is Bool), let number = value as? NSNumber else {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else {
             return nil
         }
         let typeCode = String(cString: number.objCType)

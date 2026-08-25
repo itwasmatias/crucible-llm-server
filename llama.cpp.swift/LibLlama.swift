@@ -3,6 +3,7 @@ import llama
 
 enum LlamaError: Error {
     case couldNotInitializeContext
+    case samplerInitializationFailed
     case tokenizationFailed
     case decodeFailed
 }
@@ -49,11 +50,26 @@ private enum LlamaBackendRuntime {
     }
 }
 
-private func makeSampler() -> UnsafeMutablePointer<llama_sampler> {
+private func makeSampler() throws -> UnsafeMutablePointer<llama_sampler> {
     let parameters = llama_sampler_chain_default_params()
-    let sampler = llama_sampler_chain_init(parameters)
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.4))
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(1234))
+
+    guard let sampler = llama_sampler_chain_init(parameters) else {
+        throw LlamaError.samplerInitializationFailed
+    }
+
+    guard let temperatureSampler = llama_sampler_init_temp(0.4) else {
+        llama_sampler_free(sampler)
+        throw LlamaError.samplerInitializationFailed
+    }
+    llama_sampler_chain_add(sampler, temperatureSampler)
+
+    guard let distributionSampler = llama_sampler_init_dist(1234) else {
+        // The chain owns temperatureSampler after it was added.
+        llama_sampler_free(sampler)
+        throw LlamaError.samplerInitializationFailed
+    }
+    llama_sampler_chain_add(sampler, distributionSampler)
+
     return sampler
 }
 
@@ -79,7 +95,11 @@ actor LlamaContext {
 
     var n_decode: Int32 = 0
 
-    init(model: OpaquePointer, context: OpaquePointer) {
+    init(
+        model: OpaquePointer,
+        context: OpaquePointer,
+        sampling: UnsafeMutablePointer<llama_sampler>
+    ) {
         self.model = model
         self.context = context
         self.tokens_list = []
@@ -89,7 +109,7 @@ actor LlamaContext {
             1
         )
         self.temporary_invalid_cchars = []
-        self.sampling = makeSampler()
+        self.sampling = sampling
         vocab = llama_model_get_vocab(model)
     }
 
@@ -131,7 +151,18 @@ actor LlamaContext {
             throw LlamaError.couldNotInitializeContext
         }
 
-        return LlamaContext(model: model, context: context)
+        do {
+            let sampling = try makeSampler()
+            return LlamaContext(
+                model: model,
+                context: context,
+                sampling: sampling
+            )
+        } catch {
+            llama_free(context)
+            llama_model_free(model)
+            throw error
+        }
     }
 
     func model_info() -> String {
@@ -167,7 +198,7 @@ actor LlamaContext {
             requestedOutputTokens: maxTokens
         )
 
-        resetSampler()
+        try resetSampler()
         tokens_list = promptTokens
         temporary_invalid_cchars = []
         n_decode = 0
@@ -386,13 +417,16 @@ actor LlamaContext {
         n_cur = 0
         n_decode = 0
         llama_batch_clear(&batch)
-        resetSampler()
+        // Preserve the existing valid sampler if replacement allocation fails.
+        try? resetSampler()
         llama_memory_clear(llama_get_memory(context), true)
     }
 
-    private func resetSampler() {
+    private func resetSampler() throws {
+        // Construct the replacement before releasing the current valid sampler.
+        let replacement = try makeSampler()
         llama_sampler_free(sampling)
-        sampling = makeSampler()
+        sampling = replacement
     }
 
     private func drainPendingText() -> String {

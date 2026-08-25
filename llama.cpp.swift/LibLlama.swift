@@ -1,11 +1,27 @@
 import Foundation
 import llama
 
-enum LlamaError: Error {
-    case couldNotInitializeContext
+enum LlamaError: Error, LocalizedError {
+    case modelFileLoadFailed
+    case contextInitializationFailed
     case samplerInitializationFailed
     case tokenizationFailed
     case decodeFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .modelFileLoadFailed:
+            return "MODEL_FILE_LOAD_FAILED: llama_model_load_from_file returned nil"
+        case .contextInitializationFailed:
+            return "CONTEXT_INITIALIZATION_FAILED: llama_init_from_model returned nil"
+        case .samplerInitializationFailed:
+            return "SAMPLER_INITIALIZATION_FAILED"
+        case .tokenizationFailed:
+            return "TOKENIZATION_FAILED"
+        case .decodeFailed:
+            return "DECODE_FAILED"
+        }
+    }
 }
 
 private func llama_batch_clear(_ batch: inout llama_batch) {
@@ -132,8 +148,7 @@ actor LlamaContext {
 #endif
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
-            print("Could not load model at \(path)")
-            throw LlamaError.couldNotInitializeContext
+            throw LlamaError.modelFileLoadFailed
         }
 
         let n_threads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
@@ -148,7 +163,7 @@ actor LlamaContext {
         guard let context else {
             llama_model_free(model)
             print("Could not load context!")
-            throw LlamaError.couldNotInitializeContext
+            throw LlamaError.contextInitializationFailed
         }
 
         do {

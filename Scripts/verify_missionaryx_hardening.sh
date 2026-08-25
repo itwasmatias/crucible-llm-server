@@ -86,6 +86,16 @@ require_fixed "public static let maximumOutputTokens = 128" "$core" \
     "output-token hard limit is 128"
 require_fixed "try TokenBudget.validate(" "$llama" \
     "exact tokenizer output is budget-checked"
+require_fixed "case modelFileLoadFailed" "$llama" \
+    "model-file load failure has a distinct error case"
+require_fixed "case contextInitializationFailed" "$llama" \
+    "context initialization failure has a distinct error case"
+require_fixed "MODEL_FILE_LOAD_FAILED: llama_model_load_from_file returned nil" "$llama" \
+    "model-file load failure has a deterministic diagnostic"
+require_fixed "CONTEXT_INITIALIZATION_FAILED: llama_init_from_model returned nil" "$llama" \
+    "context initialization failure has a deterministic diagnostic"
+reject_fixed "couldNotInitializeContext" "$llama" \
+    "ambiguous model/context initialization error is absent"
 require_fixed "parseSpecialTokens: true" "$state" \
     "API ChatML delimiters are parsed as model special tokens"
 require_fixed "try BatchCapacityGuard.validate(" "$llama" \

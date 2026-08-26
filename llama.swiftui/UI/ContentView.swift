@@ -10,14 +10,28 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             VStack {
-                ScrollView(.vertical, showsIndicators: true) {
-                    Text(llamaState.messageLog)
-                        .font(.system(size: 12))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding()
-                        .onTapGesture {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                        }
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: true) {
+                        Text(llamaState.messageLog)
+                            .font(.system(size: 12))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                            .onTapGesture {
+                                UIApplication.shared.sendAction(
+                                    #selector(UIResponder.resignFirstResponder),
+                                    to: nil,
+                                    from: nil,
+                                    for: nil
+                                )
+                            }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id("messageLogBottom")
+                    }
+                    .onChange(of: llamaState.messageLog) { _ in
+                        proxy.scrollTo("messageLogBottom", anchor: .bottom)
+                    }
                 }
 
                 TextEditor(text: $multiLineText)

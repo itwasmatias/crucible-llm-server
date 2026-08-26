@@ -98,6 +98,10 @@ reject_fixed "couldNotInitializeContext" "$llama" \
     "ambiguous model/context initialization error is absent"
 require_fixed "parseSpecialTokens: true" "$state" \
     "API ChatML delimiters are parsed as model special tokens"
+require_fixed "modelUrl.path(percentEncoded: false)" "$state" \
+    "local model URL is converted to a decoded filesystem path"
+reject_fixed "let modelPath = modelUrl.path()" "$state" \
+    "percent-encoded filesystem path conversion is absent"
 require_fixed "try BatchCapacityGuard.validate(" "$llama" \
     "every llama_batch_add starts with a defensive index guard"
 

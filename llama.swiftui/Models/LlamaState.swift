@@ -127,7 +127,7 @@ class LlamaState: ObservableObject {
         defer { _ = operationGate.release(lease) }
 
         messageLog += "Loading model...\n"
-        let modelPath = modelUrl.path()
+        let modelPath = modelUrl.path(percentEncoded: false)
         let newContext = try await Task.detached(priority: .userInitiated) {
             try LlamaContext.create_context(path: modelPath)
         }.value

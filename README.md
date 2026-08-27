@@ -51,7 +51,9 @@ All routes except `OPTIONS` require `Authorization: Bearer YOUR_API_KEY`.
 - `GET /ready` is inference readiness. It returns `200` with `status: ready`
   only when a model/context exists and no model operation owns the worker.
   `model_not_loaded` and `model_loading` return `503`; `busy` returns `409` and
-  identifies the active operation.
+  identifies the active operation. The active listener retains the exact worker
+  configured at server start; stop or matching listener failure releases it,
+  and a stale callback cannot clear a replacement listener's worker.
 - At most one inference, model load, benchmark, or maintenance operation owns
   the llama.cpp model/context at once. There is no request queue. A competing
   chat request receives `409 worker_busy` immediately, and a later request may
@@ -107,6 +109,9 @@ The workflow builds the llama.cpp xcframework from source, then compiles the iOS
   validation, readiness projection, and ownership. Xcode compilation, Metal,
   memory stability, signing, installation, and actual iPhone lifecycle behavior
   require the device procedure below.
+- **v0.2.1 device retest required** — the `a6a0d12` IPA exposed a reproducible
+  weak-worker lifetime failure in `/ready`. v0.2.1 corrects the ownership seam,
+  but acceptance remains open until its new IPA is installed and retested.
 
 ## Real iPhone Acceptance — v0.2
 

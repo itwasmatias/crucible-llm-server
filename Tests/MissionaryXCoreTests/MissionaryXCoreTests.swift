@@ -4,6 +4,14 @@ import XCTest
 @testable import MissionaryXCore
 
 final class MissionaryXCoreTests: XCTestCase {
+    private final class TestReadinessWorker {
+        var readiness: WorkerReadinessSnapshot
+
+        init(readiness: WorkerReadinessSnapshot) {
+            self.readiness = readiness
+        }
+    }
+
     private actor AsyncLatch {
         private var isSignaled = false
         private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -167,6 +175,210 @@ final class MissionaryXCoreTests: XCTestCase {
         XCTAssertEqual(response.status, "model_not_loaded")
         let encoded = String(decoding: try APIJSON.encode(response), as: UTF8.self)
         XCTAssertTrue(encoded.contains(#""status":"model_not_loaded""#))
+    }
+
+    func testActiveServerConfigurationRetainsWorkerUntilMatchingClear() {
+        let configuration = HTTPServerActiveConfiguration<TestReadinessWorker>()
+        let listenerID = UUID()
+        weak var retainedWorker: TestReadinessWorker?
+
+        do {
+            let worker = TestReadinessWorker(
+                readiness: WorkerReadinessSnapshot(
+                    modelAvailable: false,
+                    operation: WorkerOperationSnapshot(activeKind: nil)
+                )
+            )
+            retainedWorker = worker
+            configuration.install(
+                listenerID: listenerID,
+                worker: worker,
+                apiKey: validKey
+            )
+        }
+
+        XCTAssertNotNil(retainedWorker)
+        if let activeWorker = configuration.snapshot()?.worker,
+           let retainedWorker {
+            XCTAssertTrue(activeWorker === retainedWorker)
+            let endpoint = ReadinessEndpointResult(
+                snapshot: activeWorker.readiness
+            )
+            XCTAssertEqual(endpoint.statusCode, 503)
+            XCTAssertEqual(endpoint.response.status, "model_not_loaded")
+        } else {
+            XCTFail("The active listener configuration did not retain its worker")
+        }
+        XCTAssertTrue(configuration.clear(listenerID: listenerID))
+        XCTAssertNil(retainedWorker)
+        XCTAssertNil(configuration.snapshot())
+    }
+
+    func testConfiguredNoModelReadinessEndpointReturnsStructured503() throws {
+        let snapshot = WorkerReadinessSnapshot(
+            modelAvailable: false,
+            operation: WorkerOperationSnapshot(activeKind: nil)
+        )
+        let result = ReadinessEndpointResult(snapshot: snapshot)
+
+        XCTAssertEqual(result.statusCode, 503)
+        XCTAssertEqual(result.response.status, "model_not_loaded")
+        XCTAssertNil(result.response.model)
+        let body = String(
+            decoding: try APIJSON.encode(result.response),
+            as: UTF8.self
+        )
+        XCTAssertTrue(body.contains(#""status":"model_not_loaded""#))
+        XCTAssertFalse(body.contains("worker_not_ready"))
+    }
+
+    func testConfiguredModelLoadingReadinessEndpointReturnsStructured503() {
+        let result = ReadinessEndpointResult(
+            snapshot: WorkerReadinessSnapshot(
+                modelAvailable: false,
+                operation: WorkerOperationSnapshot(activeKind: .modelLoad)
+            )
+        )
+
+        XCTAssertEqual(result.statusCode, 503)
+        XCTAssertEqual(result.response.status, "model_loading")
+        XCTAssertEqual(result.response.operation, "modelLoad")
+    }
+
+    func testConfiguredBusyReadinessEndpointReturns409ForEveryBusyOperation() {
+        for operation in [
+            WorkerOperationKind.inference,
+            .benchmark,
+            .maintenance,
+        ] {
+            let result = ReadinessEndpointResult(
+                snapshot: WorkerReadinessSnapshot(
+                    modelAvailable: true,
+                    operation: WorkerOperationSnapshot(activeKind: operation)
+                )
+            )
+            XCTAssertEqual(result.statusCode, 409)
+            XCTAssertEqual(result.response.status, "busy")
+            XCTAssertEqual(result.response.operation, operation.rawValue)
+        }
+    }
+
+    func testConfiguredLoadedIdleReadinessEndpointReturns200() {
+        let result = ReadinessEndpointResult(
+            snapshot: WorkerReadinessSnapshot(
+                modelAvailable: true,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+
+        XCTAssertEqual(result.statusCode, 200)
+        XCTAssertEqual(result.response.status, "ready")
+        XCTAssertEqual(result.response.model, "local")
+        XCTAssertNil(result.response.operation)
+    }
+
+    func testStopAndRestartConfigurationUsesTheCurrentWorker() throws {
+        let configuration = HTTPServerActiveConfiguration<TestReadinessWorker>()
+        let firstID = UUID()
+        let secondID = UUID()
+        let first = TestReadinessWorker(
+            readiness: WorkerReadinessSnapshot(
+                modelAvailable: false,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+        let second = TestReadinessWorker(
+            readiness: WorkerReadinessSnapshot(
+                modelAvailable: true,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+
+        configuration.install(
+            listenerID: firstID,
+            worker: first,
+            apiKey: validKey
+        )
+        XCTAssertTrue(configuration.clear(listenerID: firstID))
+        configuration.install(
+            listenerID: secondID,
+            worker: second,
+            apiKey: validKey
+        )
+
+        let active = try XCTUnwrap(configuration.snapshot())
+        XCTAssertEqual(active.listenerID, secondID)
+        XCTAssertTrue(active.worker === second)
+        XCTAssertEqual(
+            ReadinessEndpointResult(snapshot: active.worker.readiness).response.status,
+            "ready"
+        )
+    }
+
+    func testStaleListenerFailureCannotClearReplacementConfiguration() {
+        let configuration = HTTPServerActiveConfiguration<TestReadinessWorker>()
+        let staleID = UUID()
+        let currentID = UUID()
+        let staleWorker = TestReadinessWorker(
+            readiness: WorkerReadinessSnapshot(
+                modelAvailable: false,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+        let currentWorker = TestReadinessWorker(
+            readiness: WorkerReadinessSnapshot(
+                modelAvailable: true,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+
+        configuration.install(
+            listenerID: staleID,
+            worker: staleWorker,
+            apiKey: validKey
+        )
+        configuration.install(
+            listenerID: currentID,
+            worker: currentWorker,
+            apiKey: validKey
+        )
+
+        XCTAssertFalse(configuration.clear(listenerID: staleID))
+        XCTAssertEqual(configuration.snapshot()?.listenerID, currentID)
+        XCTAssertTrue(configuration.snapshot()?.worker === currentWorker)
+    }
+
+    func testConfiguredAuthenticationAndHealthLivenessRemainUnchanged() throws {
+        let configuration = HTTPServerActiveConfiguration<TestReadinessWorker>()
+        let worker = TestReadinessWorker(
+            readiness: WorkerReadinessSnapshot(
+                modelAvailable: false,
+                operation: WorkerOperationSnapshot(activeKind: nil)
+            )
+        )
+        configuration.install(
+            listenerID: UUID(),
+            worker: worker,
+            apiKey: validKey
+        )
+        let active = try XCTUnwrap(configuration.snapshot())
+
+        XCTAssertNil(
+            BearerAuthenticator.validate(
+                headers: ["authorization": "Bearer \(validKey)"],
+                expectedKey: active.apiKey
+            )
+        )
+        XCTAssertEqual(
+            BearerAuthenticator.validate(headers: [:], expectedKey: active.apiKey),
+            .unauthorized
+        )
+        let health = HealthResponse(status: "ok")
+        XCTAssertEqual(health.status, "ok")
+        XCTAssertFalse(
+            String(decoding: try APIJSON.encode(health), as: UTF8.self)
+                .contains("model")
+        )
     }
 
     func testMalformedJSONIsRejected() {

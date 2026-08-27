@@ -2,7 +2,10 @@ name: Build iOS IPA
 
 on:
   push:
-    branches: [master, feature/crucible-reliability-hardening-v0-2]
+    branches:
+      - master
+      - feature/crucible-reliability-hardening-v0-2
+      - feature/crucible-readiness-device-fix-v0-2-1
   workflow_dispatch:
 
 jobs:
@@ -26,6 +29,11 @@ jobs:
 
       - name: Verify MissionaryX hardening invariants
         run: ./Scripts/verify_missionaryx_hardening.sh
+
+      - name: Run readiness correction tests
+        run: >-
+          swift test --filter
+          'MissionaryXCoreTests.test(ActiveServerConfiguration|ConfiguredNoModel|ConfiguredModelLoading|ConfiguredBusy|ConfiguredLoadedIdle|StopAndRestart|StaleListenerFailure|ConfiguredAuthentication)'
 
       - name: Run MissionaryX core tests
         run: swift test

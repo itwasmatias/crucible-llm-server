@@ -41,8 +41,10 @@ final class HTTPServer {
     private var listener: NWListener?
     private let port: UInt16
     private let configurationLock = NSLock()
-    private weak var llamaState: LlamaState?
-    private var apiKey: String?
+    // Strong by design for the active listener session. LlamaState owns this
+    // server; stop and matching listener failure clear this configuration and
+    // break the bounded ownership cycle.
+    private let activeConfiguration = HTTPServerActiveConfiguration<LlamaState>()
     private var listenerID: UUID?
     private var lifecycleHandler: ((HTTPServerLifecycleState) -> Void)?
 
@@ -93,14 +95,16 @@ final class HTTPServer {
     func stop() {
         configurationLock.lock()
         let oldListener = listener
+        let oldListenerID = listenerID
         let handler = lifecycleHandler
         listener = nil
         listenerID = nil
-        llamaState = nil
-        apiKey = nil
         lifecycleHandler = nil
         configurationLock.unlock()
 
+        if let oldListenerID {
+            _ = activeConfiguration.clear(listenerID: oldListenerID)
+        }
         oldListener?.cancel()
         handler?(.stopped)
         print("HTTP server stopped")
@@ -128,10 +132,9 @@ final class HTTPServer {
             let handler = lifecycleHandler
             listener = nil
             listenerID = nil
-            llamaState = nil
-            apiKey = nil
             lifecycleHandler = nil
             configurationLock.unlock()
+            _ = activeConfiguration.clear(listenerID: reportedID)
             handler?(.failed(error.localizedDescription))
             print("HTTP server listener failed: \(error.localizedDescription)")
         default:
@@ -235,11 +238,10 @@ final class HTTPServer {
             return
         }
 
-        let configuration = configurationSnapshot()
-        guard let apiKey = configuration.apiKey,
+        guard let configuration = configurationSnapshot(),
               BearerAuthenticator.validate(
                 headers: request.headers,
-                expectedKey: apiKey
+                expectedKey: configuration.apiKey
               ) == nil else {
             sendError(
                 connection: connection,
@@ -278,12 +280,8 @@ final class HTTPServer {
                 sendError(connection: connection, error: .methodNotAllowed)
                 return
             }
-            guard let llamaState = configuration.llamaState else {
-                sendError(connection: connection, error: .workerNotReady)
-                return
-            }
             handleReadiness(
-                llamaState: llamaState,
+                llamaState: configuration.worker,
                 connection: connection
             )
 
@@ -292,12 +290,8 @@ final class HTTPServer {
                 sendError(connection: connection, error: .methodNotAllowed)
                 return
             }
-            guard let llamaState = configuration.llamaState else {
-                sendError(connection: connection, error: .workerNotReady)
-                return
-            }
             handleModels(
-                llamaState: llamaState,
+                llamaState: configuration.worker,
                 connection: connection
             )
 
@@ -317,13 +311,9 @@ final class HTTPServer {
                 )
                 return
             }
-            guard let llamaState = configuration.llamaState else {
-                sendError(connection: connection, error: .workerNotReady)
-                return
-            }
             handleChatCompletion(
                 body: request.body,
-                llamaState: llamaState,
+                llamaState: configuration.worker,
                 connection: connection
             )
 
@@ -360,10 +350,11 @@ final class HTTPServer {
                 return
             }
             let snapshot = await llamaState.readinessSnapshot()
+            let result = ReadinessEndpointResult(snapshot: snapshot)
             self.sendJSON(
                 connection: connection,
-                statusCode: snapshot.httpStatusCode,
-                value: ReadyResponse(snapshot: snapshot)
+                statusCode: result.statusCode,
+                value: result.response
             )
         }
     }
@@ -440,9 +431,12 @@ final class HTTPServer {
         configurationLock.lock()
         self.listener = listener
         self.listenerID = listenerID
-        self.llamaState = llamaState
-        self.apiKey = apiKey
         self.lifecycleHandler = lifecycleHandler
+        activeConfiguration.install(
+            listenerID: listenerID,
+            worker: llamaState,
+            apiKey: apiKey
+        )
         configurationLock.unlock()
     }
 
@@ -460,13 +454,8 @@ final class HTTPServer {
             .lowercased() == "application/json"
     }
 
-    private func configurationSnapshot() -> (
-        llamaState: LlamaState?,
-        apiKey: String?
-    ) {
-        configurationLock.lock()
-        defer { configurationLock.unlock() }
-        return (llamaState, apiKey)
+    private func configurationSnapshot() -> HTTPServerActiveConfiguration<LlamaState>.Snapshot? {
+        activeConfiguration.snapshot()
     }
 
     private func sendJSON<T: Encodable>(

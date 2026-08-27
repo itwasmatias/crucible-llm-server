@@ -962,3 +962,67 @@ public struct ReadyResponse: Codable, Equatable, Sendable {
         self.operation = snapshot.operation?.rawValue
     }
 }
+
+public struct ReadinessEndpointResult: Equatable, Sendable {
+    public let statusCode: Int
+    public let response: ReadyResponse
+
+    public init(snapshot: WorkerReadinessSnapshot) {
+        self.statusCode = snapshot.httpStatusCode
+        self.response = ReadyResponse(snapshot: snapshot)
+    }
+}
+
+/// Atomic active-listener configuration. The listener retains its worker for
+/// exactly the active configuration lifetime; stop or matching listener failure
+/// clears that ownership. Listener identity prevents a stale callback from
+/// clearing a newer worker/key pair.
+public final class HTTPServerActiveConfiguration<Worker: AnyObject>: @unchecked Sendable {
+    public struct Snapshot {
+        public let listenerID: UUID
+        public let worker: Worker
+        public let apiKey: String
+
+        fileprivate init(listenerID: UUID, worker: Worker, apiKey: String) {
+            self.listenerID = listenerID
+            self.worker = worker
+            self.apiKey = apiKey
+        }
+    }
+
+    private let lock = NSLock()
+    private var active: Snapshot?
+
+    public init() {}
+
+    public func install(
+        listenerID: UUID,
+        worker: Worker,
+        apiKey: String
+    ) {
+        lock.lock()
+        active = Snapshot(
+            listenerID: listenerID,
+            worker: worker,
+            apiKey: apiKey
+        )
+        lock.unlock()
+    }
+
+    public func snapshot() -> Snapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
+    }
+
+    @discardableResult
+    public func clear(listenerID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active?.listenerID == listenerID else {
+            return false
+        }
+        active = nil
+        return true
+    }
+}

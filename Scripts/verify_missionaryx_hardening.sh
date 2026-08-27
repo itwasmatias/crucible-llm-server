@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly FEATURE_BRANCH="feature/crucible-reliability-hardening-v0-2"
+readonly READINESS_FIX_BRANCH="feature/crucible-readiness-device-fix-v0-2-1"
 readonly REQUIRED_ANCESTOR="db7c040250e62bec1a5ef2717163999595ee71be"
 readonly REQUIRED_LLAMA="4d828bd1ab52773ba9570cc008cf209eb4a8b2f5"
 
@@ -42,7 +43,9 @@ reject_fixed() {
 }
 
 actual_branch="${GITHUB_REF_NAME:-$(git branch --show-current)}"
-if [[ "$actual_branch" == "$FEATURE_BRANCH" || "$actual_branch" == "master" ]]; then
+if [[ "$actual_branch" == "$FEATURE_BRANCH"
+    || "$actual_branch" == "$READINESS_FIX_BRANCH"
+    || "$actual_branch" == "master" ]]; then
     pass "supported validation branch"
 else
     fail "supported validation branch"
@@ -165,6 +168,12 @@ require_fixed 'case "/ready":' "$server" \
     "readiness endpoint exists"
 require_fixed "WorkerReadinessSnapshot(" "$state" \
     "readiness is derived from model and live operation state"
+require_fixed "HTTPServerActiveConfiguration<LlamaState>()" "$server" \
+    "active listener configuration strongly owns its live worker"
+reject_fixed "private weak var llamaState" "$server" \
+    "active listener worker cannot disappear through weak zeroing"
+require_fixed "ReadinessEndpointResult(snapshot: snapshot)" "$server" \
+    "live readiness route uses the tested endpoint projection"
 require_fixed 'case modelLoading = "model_loading"' "$core" \
     "readiness distinguishes model loading"
 require_fixed 'case busy' "$core" \

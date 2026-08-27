@@ -2,7 +2,7 @@ name: Build iOS IPA
 
 on:
   push:
-    branches: [master]
+    branches: [master, feature/crucible-reliability-hardening-v0-2]
   workflow_dispatch:
 
 jobs:

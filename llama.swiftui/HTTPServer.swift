@@ -1,6 +1,13 @@
 import Foundation
 import Network
 
+enum HTTPServerLifecycleState: Equatable {
+    case starting
+    case ready
+    case stopped
+    case failed(String)
+}
+
 /// Bounded HTTP/1.1 server for controlled MissionaryX device testing.
 ///
 /// This intentionally supports one request per connection, no chunked transfer,
@@ -36,15 +43,25 @@ final class HTTPServer {
     private let configurationLock = NSLock()
     private weak var llamaState: LlamaState?
     private var apiKey: String?
+    private var listenerID: UUID?
+    private var lifecycleHandler: ((HTTPServerLifecycleState) -> Void)?
 
-    var isRunning: Bool { listener != nil }
+    var isRunning: Bool {
+        configurationLock.lock()
+        defer { configurationLock.unlock() }
+        return listener != nil
+    }
 
     init(port: UInt16 = 8080) {
         self.port = port
     }
 
-    func start(llamaState: LlamaState, apiKey: String) throws {
-        guard listener == nil, !apiKey.isEmpty else {
+    func start(
+        llamaState: LlamaState,
+        apiKey: String,
+        lifecycleHandler: @escaping (HTTPServerLifecycleState) -> Void
+    ) throws {
+        guard !isRunning, !apiKey.isEmpty else {
             throw MissionaryXAPIError.workerNotReady
         }
 
@@ -54,30 +71,72 @@ final class HTTPServer {
             using: parameters,
             on: NWEndpoint.Port(rawValue: port)!
         )
+        let newListenerID = UUID()
         newListener.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
         }
-        newListener.stateUpdateHandler = { state in
-            switch state {
-            case .failed(let error):
-                print("HTTP server listener failed: \(error.localizedDescription)")
-            case .ready:
-                print("HTTP server listener ready")
-            default:
-                break
-            }
+        newListener.stateUpdateHandler = { [weak self] state in
+            self?.handleListenerState(state, listenerID: newListenerID)
         }
-        setConfiguration(llamaState: llamaState, apiKey: apiKey)
-        listener = newListener
+        setConfiguration(
+            listener: newListener,
+            listenerID: newListenerID,
+            llamaState: llamaState,
+            apiKey: apiKey,
+            lifecycleHandler: lifecycleHandler
+        )
+        lifecycleHandler(.starting)
         newListener.start(queue: .global(qos: .userInitiated))
         print("HTTP server starting on port \(port)")
     }
 
     func stop() {
-        listener?.cancel()
+        configurationLock.lock()
+        let oldListener = listener
+        let handler = lifecycleHandler
         listener = nil
-        clearConfiguration()
+        listenerID = nil
+        llamaState = nil
+        apiKey = nil
+        lifecycleHandler = nil
+        configurationLock.unlock()
+
+        oldListener?.cancel()
+        handler?(.stopped)
         print("HTTP server stopped")
+    }
+
+    private func handleListenerState(
+        _ state: NWListener.State,
+        listenerID reportedID: UUID
+    ) {
+        switch state {
+        case .ready:
+            configurationLock.lock()
+            let handler = listenerID == reportedID ? lifecycleHandler : nil
+            configurationLock.unlock()
+            handler?(.ready)
+            if handler != nil {
+                print("HTTP server listener ready")
+            }
+        case .failed(let error):
+            configurationLock.lock()
+            guard listenerID == reportedID else {
+                configurationLock.unlock()
+                return
+            }
+            let handler = lifecycleHandler
+            listener = nil
+            listenerID = nil
+            llamaState = nil
+            apiKey = nil
+            lifecycleHandler = nil
+            configurationLock.unlock()
+            handler?(.failed(error.localizedDescription))
+            print("HTTP server listener failed: \(error.localizedDescription)")
+        default:
+            break
+        }
     }
 
     func getLocalIP() -> String {
@@ -300,17 +359,11 @@ final class HTTPServer {
                 connection.cancel()
                 return
             }
-            guard await llamaState.isReadyForInference() else {
-                self.sendError(
-                    connection: connection,
-                    error: .workerNotReady
-                )
-                return
-            }
+            let snapshot = await llamaState.readinessSnapshot()
             self.sendJSON(
                 connection: connection,
-                statusCode: 200,
-                value: ReadyResponse()
+                statusCode: snapshot.httpStatusCode,
+                value: ReadyResponse(snapshot: snapshot)
             )
         }
     }
@@ -336,21 +389,11 @@ final class HTTPServer {
                 connection.cancel()
                 return
             }
-            guard let lease = await llamaState.tryBeginInference() else {
-                self.sendError(
-                    connection: connection,
-                    error: .workerBusy
-                )
-                return
-            }
-
             do {
                 let result = try await llamaState.completeForAPI(
                     text: validatedRequest.renderedPrompt,
-                    maxTokens: validatedRequest.maxTokens,
-                    lease: lease
+                    maxTokens: validatedRequest.maxTokens
                 )
-                await llamaState.endOperation(lease)
 
                 let response = ChatCompletionResponse(
                     id: "chatcmpl-\(UUID().uuidString.prefix(8))",
@@ -374,13 +417,11 @@ final class HTTPServer {
                     value: response
                 )
             } catch let apiError as MissionaryXAPIError {
-                await llamaState.endOperation(lease)
                 self.sendError(
                     connection: connection,
                     error: apiError
                 )
             } catch {
-                await llamaState.endOperation(lease)
                 self.sendError(
                     connection: connection,
                     error: .inferenceFailed
@@ -389,10 +430,19 @@ final class HTTPServer {
         }
     }
 
-    private func setConfiguration(llamaState: LlamaState, apiKey: String) {
+    private func setConfiguration(
+        listener: NWListener,
+        listenerID: UUID,
+        llamaState: LlamaState,
+        apiKey: String,
+        lifecycleHandler: @escaping (HTTPServerLifecycleState) -> Void
+    ) {
         configurationLock.lock()
+        self.listener = listener
+        self.listenerID = listenerID
         self.llamaState = llamaState
         self.apiKey = apiKey
+        self.lifecycleHandler = lifecycleHandler
         configurationLock.unlock()
     }
 
@@ -408,13 +458,6 @@ final class HTTPServer {
         return String(mediaType)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "application/json"
-    }
-
-    private func clearConfiguration() {
-        configurationLock.lock()
-        llamaState = nil
-        apiKey = nil
-        configurationLock.unlock()
     }
 
     private func configurationSnapshot() -> (

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject var llamaState = LlamaState()
     @State private var multiLineText = ""
     @State private var showingHelp = false
@@ -109,6 +110,10 @@ struct ContentView: View {
                         Text(llamaState.serverAddress)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    } else {
+                        Text(llamaState.serverStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 }
                 .buttonStyle(.bordered)
@@ -123,6 +128,11 @@ struct ContentView: View {
             .padding()
             .navigationBarTitle("Model Settings", displayMode: .inline)
 
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .background {
+                llamaState.stopServerForBackground()
+            }
         }
     }
 

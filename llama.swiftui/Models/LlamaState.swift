@@ -18,6 +18,7 @@ class LlamaState: ObservableObject {
 
     @Published var serverRunning = false
     @Published var serverAddress = ""
+    @Published private(set) var serverStatus = "stopped"
     @Published private(set) var apiKeyConfigured = false
     let httpServer = HTTPServer(port: 8080)
 
@@ -315,16 +316,6 @@ class LlamaState: ObservableObject {
 
     // MARK: - Worker state
 
-    func tryBeginInference() -> WorkerOperationLease? {
-        operationGate.tryAcquire(.inference)
-    }
-
-    func endOperation(_ lease: WorkerOperationLease) {
-        if !operationGate.release(lease) {
-            print("Worker operation lease release mismatch")
-        }
-    }
-
     func modelsResponse() -> ModelsResponse {
         ModelsResponse(
             model: loadedModel,
@@ -332,10 +323,11 @@ class LlamaState: ObservableObject {
         )
     }
 
-    func isReadyForInference() -> Bool {
-        llamaContext != nil
-            && loadedModel != nil
-            && !operationGate.snapshot().isBusy
+    func readinessSnapshot() -> WorkerReadinessSnapshot {
+        WorkerReadinessSnapshot(
+            modelAvailable: llamaContext != nil && loadedModel != nil,
+            operation: operationGate.snapshot()
+        )
     }
 
     // MARK: - HTTP Server
@@ -343,9 +335,6 @@ class LlamaState: ObservableObject {
     func toggleServer() {
         if serverRunning {
             httpServer.stop()
-            serverRunning = false
-            serverAddress = ""
-            messageLog += "Server stopped\n"
             return
         }
 
@@ -355,19 +344,70 @@ class LlamaState: ObservableObject {
                 messageLog += "Configure an API key before starting the server\n"
                 return
             }
-            try httpServer.start(llamaState: self, apiKey: apiKey)
+            try httpServer.start(
+                llamaState: self,
+                apiKey: apiKey
+            ) { [weak self] state in
+                Task { @MainActor [weak self] in
+                    self?.applyServerLifecycle(state)
+                }
+            }
             apiKeyConfigured = true
             serverRunning = true
-            let ip = httpServer.getLocalIP()
-            serverAddress = "http://\(ip):8080"
-            messageLog += "Server started at \(serverAddress)\n"
+            serverStatus = "starting"
+            serverAddress = ""
+            messageLog += "Server starting\n"
         } catch {
             messageLog += "Failed to start server: \(error.localizedDescription)\n"
         }
     }
 
-    // The caller must hold the exact inference lease for the entire operation.
+    func stopServerForBackground() {
+        guard serverRunning else { return }
+        httpServer.stop()
+        messageLog += "Server stopped because Crucible left the foreground\n"
+    }
+
+    private func applyServerLifecycle(_ state: HTTPServerLifecycleState) {
+        switch state {
+        case .starting:
+            serverRunning = true
+            serverStatus = "starting"
+            serverAddress = ""
+        case .ready:
+            serverRunning = true
+            serverStatus = "listening"
+            serverAddress = "http://\(httpServer.getLocalIP()):8080"
+            messageLog += "Server listening at \(serverAddress)\n"
+        case .stopped:
+            serverRunning = false
+            serverStatus = "stopped"
+            serverAddress = ""
+            messageLog += "Server stopped\n"
+        case .failed(let description):
+            serverRunning = false
+            serverStatus = "failed"
+            serverAddress = ""
+            messageLog += "Server listener failed: \(description)\n"
+        }
+    }
+
     func completeForAPI(
+        text: String,
+        maxTokens: Int
+    ) async throws -> CompletionResult {
+        try await operationGate.withLease(.inference) { lease in
+            try await self.completeForAPI(
+                text: text,
+                maxTokens: maxTokens,
+                lease: lease
+            )
+        }
+    }
+
+    // The exact lease remains owned across tokenization, generation, cleanup,
+    // and output validation. No other model operation can overlap this scope.
+    private func completeForAPI(
         text: String,
         maxTokens: Int,
         lease: WorkerOperationLease

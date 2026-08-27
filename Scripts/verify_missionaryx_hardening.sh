@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly REQUIRED_BRANCH="feature/missionaryx-crucible-hardening-v0-1"
+readonly FEATURE_BRANCH="feature/crucible-reliability-hardening-v0-2"
 readonly REQUIRED_ANCESTOR="db7c040250e62bec1a5ef2717163999595ee71be"
 readonly REQUIRED_LLAMA="4d828bd1ab52773ba9570cc008cf209eb4a8b2f5"
 
@@ -42,10 +42,10 @@ reject_fixed() {
 }
 
 actual_branch="${GITHUB_REF_NAME:-$(git branch --show-current)}"
-if [[ "$actual_branch" == "$REQUIRED_BRANCH" ]]; then
-    pass "required feature branch"
+if [[ "$actual_branch" == "$FEATURE_BRANCH" || "$actual_branch" == "master" ]]; then
+    pass "supported validation branch"
 else
-    fail "required feature branch"
+    fail "supported validation branch"
 fi
 
 if git merge-base --is-ancestor "$REQUIRED_ANCESTOR" HEAD; then
@@ -144,10 +144,12 @@ require_fixed "private let operationGate = WorkerOperationGate()" "$state" \
     "one explicit whole-worker operation gate exists"
 require_fixed "operationGate.owns(lease)" "$state" \
     "API inference requires ownership of the exact lease"
-require_fixed "guard let lease = await llamaState.tryBeginInference()" "$server" \
-    "HTTP inference must acquire the gate before dispatch"
+require_fixed "try await operationGate.withLease(.inference)" "$state" \
+    "API inference acquires and automatically releases the gate"
 require_fixed "guard let lease = operationGate.tryAcquire(.modelLoad)" "$state" \
     "model replacement must acquire the same gate"
+require_fixed "public func withLease<T>(" "$core" \
+    "single-flight execution seam releases ownership on every exit"
 
 require_fixed "public static let modelNotLoaded" "$core" \
     "no-model error has structured API semantics"
@@ -161,6 +163,12 @@ require_fixed 'case "/health":' "$server" \
     "liveness endpoint exists"
 require_fixed 'case "/ready":' "$server" \
     "readiness endpoint exists"
+require_fixed "WorkerReadinessSnapshot(" "$state" \
+    "readiness is derived from model and live operation state"
+require_fixed 'case modelLoading = "model_loading"' "$core" \
+    "readiness distinguishes model loading"
+require_fixed 'case busy' "$core" \
+    "readiness distinguishes busy operation state"
 
 require_fixed "BearerAuthenticator.validate(" "$server" \
     "bearer authentication gates routed endpoints"

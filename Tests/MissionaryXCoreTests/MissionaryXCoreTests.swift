@@ -4,6 +4,32 @@ import XCTest
 @testable import MissionaryXCore
 
 final class MissionaryXCoreTests: XCTestCase {
+    private actor AsyncLatch {
+        private var isSignaled = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            guard !isSignaled else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func signal() {
+            guard !isSignaled else { return }
+            isSignaled = true
+            let pending = waiters
+            waiters.removeAll()
+            for continuation in pending {
+                continuation.resume()
+            }
+        }
+    }
+
+    private enum ExpectedFailure: Error {
+        case inference
+    }
+
     private final class LeaseCollector: @unchecked Sendable {
         private let lock = NSLock()
         private var leases: [WorkerOperationLease] = []
@@ -96,6 +122,51 @@ final class MissionaryXCoreTests: XCTestCase {
         )
         XCTAssertTrue(idle.data[0].ready)
         XCTAssertTrue(idle.state.ready)
+    }
+
+    func testReadinessDistinguishesUnavailableLoadingBusyAndReady() {
+        let unavailable = WorkerReadinessSnapshot(
+            modelAvailable: false,
+            operation: WorkerOperationSnapshot(activeKind: nil)
+        )
+        XCTAssertEqual(unavailable.status, .modelNotLoaded)
+        XCTAssertEqual(unavailable.httpStatusCode, 503)
+
+        let loading = WorkerReadinessSnapshot(
+            modelAvailable: false,
+            operation: WorkerOperationSnapshot(activeKind: .modelLoad)
+        )
+        XCTAssertEqual(loading.status, .modelLoading)
+        XCTAssertEqual(loading.httpStatusCode, 503)
+
+        let busy = WorkerReadinessSnapshot(
+            modelAvailable: true,
+            operation: WorkerOperationSnapshot(activeKind: .inference)
+        )
+        XCTAssertEqual(busy.status, .busy)
+        XCTAssertEqual(busy.operation, .inference)
+        XCTAssertEqual(busy.httpStatusCode, 409)
+
+        let ready = WorkerReadinessSnapshot(
+            modelAvailable: true,
+            operation: WorkerOperationSnapshot(activeKind: nil)
+        )
+        XCTAssertEqual(ready.status, .ready)
+        XCTAssertTrue(ready.isReady)
+        XCTAssertEqual(ready.httpStatusCode, 200)
+    }
+
+    func testReadinessResponseDoesNotInventAnUnloadedModel() throws {
+        let snapshot = WorkerReadinessSnapshot(
+            modelAvailable: false,
+            operation: WorkerOperationSnapshot(activeKind: nil)
+        )
+        let response = ReadyResponse(snapshot: snapshot)
+        XCTAssertNil(response.model)
+        XCTAssertNil(response.operation)
+        XCTAssertEqual(response.status, "model_not_loaded")
+        let encoded = String(decoding: try APIJSON.encode(response), as: UTF8.self)
+        XCTAssertTrue(encoded.contains(#""status":"model_not_loaded""#))
     }
 
     func testMalformedJSONIsRejected() {
@@ -289,6 +360,53 @@ final class MissionaryXCoreTests: XCTestCase {
         XCTAssertNotNil(gate.tryAcquire(.modelLoad))
     }
 
+    func testSingleFlightContentionAndRecoveryAtExecutionSeam() async throws {
+        let gate = WorkerOperationGate()
+        let firstStarted = AsyncLatch()
+        let releaseFirst = AsyncLatch()
+
+        let first = Task.detached {
+            try await gate.withLease(.inference) { _ in
+                await firstStarted.signal()
+                await releaseFirst.wait()
+                return "A"
+            }
+        }
+        await firstStarted.wait()
+
+        do {
+            _ = try await gate.withLease(.inference) { _ in "B" }
+            XCTFail("A competing generation must not enter the operation")
+        } catch let error as MissionaryXAPIError {
+            XCTAssertEqual(error, .workerBusy)
+        }
+
+        await releaseFirst.signal()
+        let firstResult = try await first.value
+        XCTAssertEqual(firstResult, "A")
+        XCTAssertFalse(gate.snapshot().isBusy)
+
+        let third = try await gate.withLease(.inference) { _ in "C" }
+        XCTAssertEqual(third, "C")
+        XCTAssertFalse(gate.snapshot().isBusy)
+    }
+
+    func testSingleFlightLeaseIsReleasedAfterInferenceFailure() async throws {
+        let gate = WorkerOperationGate()
+        do {
+            _ = try await gate.withLease(.inference) { _ -> String in
+                throw ExpectedFailure.inference
+            }
+            XCTFail("Expected the simulated inference failure")
+        } catch ExpectedFailure.inference {
+            // Expected.
+        }
+
+        XCTAssertFalse(gate.snapshot().isBusy)
+        let recovered = try await gate.withLease(.inference) { _ in "recovered" }
+        XCTAssertEqual(recovered, "recovered")
+    }
+
     func testFinishReasonDistinguishesLengthAndStop() {
         XCTAssertEqual(
             CompletionTermination.endOfGeneration.finishReason,
@@ -379,6 +497,118 @@ final class MissionaryXCoreTests: XCTestCase {
         default:
             XCTFail("Expected a complete parsed request")
         }
+    }
+
+    func testFragmentedHTTPHeadersAreAssembledBeforeParsing() {
+        let accumulator = HTTPRequestAccumulator()
+        let fragments = [
+            "GET /hea",
+            "lth HTTP/1.1\r\nHost: pho",
+            "ne\r\nAuthorization: Bearer \(validKey)\r\n",
+            "\r\n",
+        ]
+
+        for fragment in fragments.dropLast() {
+            guard case .needMoreData = accumulator.append(
+                Data(fragment.utf8),
+                streamEnded: false
+            ) else {
+                XCTFail("Expected another header fragment")
+                return
+            }
+        }
+
+        guard case .complete(let request) = accumulator.append(
+            Data(fragments.last!.utf8),
+            streamEnded: false
+        ) else {
+            XCTFail("Expected a complete fragmented request")
+            return
+        }
+        XCTAssertEqual(request.method, "GET")
+        XCTAssertEqual(request.path, "/health")
+    }
+
+    func testHeaderLimitAcceptsExactBoundaryAndRejectsOneByteOver() {
+        let prefix = "GET /health HTTP/1.1\r\nX-Fill: "
+        let exactFillCount = MissionaryXLimits.maximumHeaderBytes - prefix.utf8.count
+        let exact = HTTPRequestAccumulator()
+        let exactData = Data(
+            (prefix + String(repeating: "a", count: exactFillCount) + "\r\n\r\n").utf8
+        )
+        guard case .complete = exact.append(exactData, streamEnded: false) else {
+            XCTFail("The exact header limit must be accepted")
+            return
+        }
+
+        let oversized = HTTPRequestAccumulator()
+        let oversizedData = Data(
+            (prefix + String(repeating: "a", count: exactFillCount + 1) + "\r\n\r\n").utf8
+        )
+        guard case .failure(let error) = oversized.append(
+            oversizedData,
+            streamEnded: false
+        ) else {
+            XCTFail("Expected headers_too_large")
+            return
+        }
+        XCTAssertEqual(error, .headersTooLarge)
+    }
+
+    func testBodyLimitAcceptsExactBoundary() {
+        let body = Data(repeating: 0x78, count: MissionaryXLimits.maximumBodyBytes)
+        var request = Data(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: \(body.count)\r\n\r\n".utf8
+        )
+        request.append(body)
+
+        let accumulator = HTTPRequestAccumulator()
+        guard case .complete(let parsed) = accumulator.append(
+            request,
+            streamEnded: false
+        ) else {
+            XCTFail("The exact body limit must be accepted by framing")
+            return
+        }
+        XCTAssertEqual(parsed.body.count, MissionaryXLimits.maximumBodyBytes)
+    }
+
+    func testMalformedHeaderSyntaxAndPrematureHeaderEOFRecoverIndependently() {
+        for malformed in [
+            "GET /health HTTP/1.1\r\nBad Name: value\r\n\r\n",
+            "GET /health HTTP/1.1\r\nX-Test: before\u{0}after\r\n\r\n",
+            "GET /health HTTP/1.1\r\nX-Test: \u{0B}value\r\n\r\n",
+        ] {
+            let accumulator = HTTPRequestAccumulator()
+            guard case .failure(let error) = accumulator.append(
+                Data(malformed.utf8),
+                streamEnded: false
+            ) else {
+                XCTFail("Expected malformed_request")
+                continue
+            }
+            XCTAssertEqual(error, .malformedRequest)
+        }
+
+        let premature = HTTPRequestAccumulator()
+        guard case .failure(let error) = premature.append(
+            Data("GET /health HTTP/1.1\r\nHost: phone".utf8),
+            streamEnded: true
+        ) else {
+            XCTFail("Expected malformed_request after premature header EOF")
+            return
+        }
+        XCTAssertEqual(error, .malformedRequest)
+
+        let laterConnection = HTTPRequestAccumulator()
+        guard case .complete(let request) = laterConnection.append(
+            Data("GET /health HTTP/1.1\r\nHost: phone\r\n\r\n".utf8),
+            streamEnded: false
+        ) else {
+            XCTFail("A malformed connection must not poison a later connection")
+            return
+        }
+        XCTAssertEqual(request.path, "/health")
     }
 
     func testIncompleteBodyAndChunkedEncodingFailClosed() {

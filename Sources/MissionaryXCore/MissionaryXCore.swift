@@ -399,11 +399,18 @@ public final class HTTPRequestAccumulator {
             guard let colon = line.firstIndex(of: ":") else {
                 return .failure(.malformedRequest)
             }
-            let name = String(line[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty, headers[name] == nil else {
+            let rawName = String(line[..<colon])
+            guard isValidHeaderName(rawName) else {
                 return .failure(.malformedRequest)
             }
+            let name = rawName.lowercased()
+            let rawValue = String(line[line.index(after: colon)...])
+            guard isValidHeaderValue(rawValue), headers[name] == nil else {
+                return .failure(.malformedRequest)
+            }
+            let value = rawValue.trimmingCharacters(
+                in: CharacterSet(charactersIn: " \t")
+            )
             headers[name] = value
         }
 
@@ -441,6 +448,22 @@ public final class HTTPRequestAccumulator {
                 contentLength: contentLength
             )
         )
+    }
+
+    private func isValidHeaderName(_ name: String) -> Bool {
+        let allowedPunctuation = Set("!#$%&'*+-.^_`|~".utf8)
+        return !name.isEmpty && name.utf8.allSatisfy { byte in
+            (byte >= 0x30 && byte <= 0x39)
+                || (byte >= 0x41 && byte <= 0x5A)
+                || (byte >= 0x61 && byte <= 0x7A)
+                || allowedPunctuation.contains(byte)
+        }
+    }
+
+    private func isValidHeaderValue(_ value: String) -> Bool {
+        value.utf8.allSatisfy { byte in
+            byte == 0x09 || (byte >= 0x20 && byte != 0x7F)
+        }
     }
 }
 
@@ -709,6 +732,19 @@ public final class WorkerOperationGate: @unchecked Sendable {
         defer { lock.unlock() }
         return activeLease == lease
     }
+
+    /// Runs one operation while holding the worker's single-flight lease.
+    /// The lease is released on success, failure, or task cancellation.
+    public func withLease<T>(
+        _ kind: WorkerOperationKind,
+        operation: (WorkerOperationLease) async throws -> T
+    ) async throws -> T {
+        guard let lease = tryAcquire(kind) else {
+            throw MissionaryXAPIError.workerBusy
+        }
+        defer { _ = release(lease) }
+        return try await operation(lease)
+    }
 }
 
 public enum CompletionFinishReason: String, Codable, Equatable, Sendable {
@@ -867,6 +903,46 @@ public struct ModelsResponse: Codable, Equatable, Sendable {
     }
 }
 
+public enum WorkerReadinessStatus: String, Codable, Equatable, Sendable {
+    case ready
+    case modelNotLoaded = "model_not_loaded"
+    case modelLoading = "model_loading"
+    case busy
+}
+
+public struct WorkerReadinessSnapshot: Equatable, Sendable {
+    public let status: WorkerReadinessStatus
+    public let operation: WorkerOperationKind?
+    public let modelAvailable: Bool
+
+    public var isReady: Bool { status == .ready }
+
+    public var httpStatusCode: Int {
+        switch status {
+        case .ready:
+            return 200
+        case .busy:
+            return MissionaryXAPIError.workerBusy.statusCode
+        case .modelNotLoaded, .modelLoading:
+            return MissionaryXAPIError.workerNotReady.statusCode
+        }
+    }
+
+    public init(modelAvailable: Bool, operation: WorkerOperationSnapshot) {
+        self.modelAvailable = modelAvailable
+        self.operation = operation.activeKind
+        if operation.isModelLoading {
+            self.status = .modelLoading
+        } else if !modelAvailable {
+            self.status = .modelNotLoaded
+        } else if operation.isBusy {
+            self.status = .busy
+        } else {
+            self.status = .ready
+        }
+    }
+}
+
 public struct HealthResponse: Codable, Equatable, Sendable {
     public let status: String
 
@@ -877,10 +953,12 @@ public struct HealthResponse: Codable, Equatable, Sendable {
 
 public struct ReadyResponse: Codable, Equatable, Sendable {
     public let status: String
-    public let model: String
+    public let model: String?
+    public let operation: String?
 
-    public init() {
-        self.status = "ready"
-        self.model = "local"
+    public init(snapshot: WorkerReadinessSnapshot) {
+        self.status = snapshot.status.rawValue
+        self.model = snapshot.modelAvailable ? "local" : nil
+        self.operation = snapshot.operation?.rawValue
     }
 }
